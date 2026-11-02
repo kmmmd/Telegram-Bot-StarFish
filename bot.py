@@ -1,8 +1,11 @@
 import os
+import json
+import time
 import asyncio
 import logging
 from collections import defaultdict
 
+import tornado.web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -13,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -33,7 +37,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("starfish")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Hər model üçün maksimum gözləmə: 20 saniyə (millisaniyə ilə)
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=20000),
+)
 
 # Əvvəlki kodda işləyən model siyahısı (biri məşğuldursa növbətiyə keçir)
 CANDIDATE_MODELS = [
@@ -97,6 +105,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def generate_reply(contents: list[dict]) -> str | None:
     """Modelləri növbə ilə yoxlayır. Bloklayıcıdır, to_thread ilə çağırılır."""
     for model_name in CANDIDATE_MODELS:
+        started = time.perf_counter()
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -104,9 +113,17 @@ def generate_reply(contents: list[dict]) -> str | None:
                 config={"system_instruction": SYSTEM_INSTRUCTION},
             )
             if response.text:
+                logger.info(
+                    "%s cavab verdi (%.1f san)", model_name, time.perf_counter() - started
+                )
                 return response.text
         except Exception as e:
-            logger.warning("%s xəta verdi, növbəti model yoxlanılır: %s", model_name, e)
+            logger.warning(
+                "%s xəta verdi (%.1f san), növbəti model yoxlanılır: %s",
+                model_name,
+                time.perf_counter() - started,
+                e,
+            )
     return None
 
 
@@ -148,6 +165,60 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Gözlənilməz xəta", exc_info=context.error)
 
 
+class HealthHandler(tornado.web.RequestHandler):
+    """UptimeRobot üçün: servis oyaq olanda 200 OK qaytarır."""
+
+    def get(self):
+        self.write("OK")
+
+    def head(self):
+        self.set_status(200)
+
+
+class TelegramWebhookHandler(tornado.web.RequestHandler):
+    """Telegram-dan gələn yenilikləri qəbul edib botun növbəsinə qoyur."""
+
+    def initialize(self, ptb_app):
+        self.ptb_app = ptb_app
+
+    async def post(self):
+        if WEBHOOK_SECRET:
+            token = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if token != WEBHOOK_SECRET:
+                self.set_status(403)
+                return
+        try:
+            update = Update.de_json(json.loads(self.request.body), self.ptb_app.bot)
+        except Exception:
+            logger.warning("Etibarsız webhook sorğusu")
+            self.set_status(400)
+            return
+        await self.ptb_app.update_queue.put(update)
+        self.set_status(200)
+
+
+async def run_webhook_server(ptb_app):
+    async with ptb_app:
+        await ptb_app.start()
+        await ptb_app.bot.set_webhook(
+            url=f"{RENDER_URL}/telegram",
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True,
+        )
+        web = tornado.web.Application(
+            [
+                (r"/health", HealthHandler),
+                (r"/telegram", TelegramWebhookHandler, {"ptb_app": ptb_app}),
+            ]
+        )
+        web.listen(PORT, address="0.0.0.0")
+        print("🤖 StarFish botu webhook rejimində aktivdir...")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await ptb_app.stop()
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
@@ -157,15 +228,7 @@ def main():
     app.add_error_handler(error_handler)
 
     if RENDER_URL:
-        print("🤖 StarFish botu webhook rejimində aktivdir...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="telegram",
-            webhook_url=f"{RENDER_URL}/telegram",
-            secret_token=WEBHOOK_SECRET or None,
-            drop_pending_updates=True,
-        )
+        asyncio.run(run_webhook_server(app))
     else:
         print("🤖 StarFish botu polling rejimində aktivdir...")
         app.run_polling()
