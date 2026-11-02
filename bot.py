@@ -1,39 +1,41 @@
 import os
 import asyncio
 import logging
+from collections import defaultdict
+
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from google import genai
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Render bu iki dəyişəni avtomatik verir (webhook rejimi üçün)
-PORT = int(os.getenv("PORT", "10000"))
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
-
-# İstəyə görə: Telegram sorğusunu yoxlamaq üçün gizli söz (yalnız hərf, rəqəm, _ və -)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render-də avtomatik olur
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # istəyə görə
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("Zəhmət olmasa .env faylında TELEGRAM_BOT_TOKEN və GEMINI_API_KEY təyin edin.")
+    raise ValueError("TELEGRAM_BOT_TOKEN və GEMINI_API_KEY təyin edilməlidir.")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+# httpx URL-ləri loqlayır, bu da Telegram tokenini göstərərdi
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("starfish")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-SYSTEM_PROMPT = (
-    "Sən 'StarFish' adlı intellektual köməkçisisən. "
-    "İstifadəçi ilə hər zaman səlis Azərbaycan dilində ünsiyyət qur."
-)
-
-# Yoxlanacaq modellərin prioriteti (biri yüklənibsə, dərhal növbətiyə keçəcək)
+# Əvvəlki kodda işləyən model siyahısı (biri məşğuldursa növbətiyə keçir)
 CANDIDATE_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
@@ -47,43 +49,69 @@ CANDIDATE_MODELS = [
     "gemma-4-26b-a4b-it",
 ]
 
+SYSTEM_INSTRUCTION = (
+    "Sən 'StarFish' adlı Telegram köməkçisisən. İstifadəçi ilə hər zaman səlis "
+    "Azərbaycan dilində danış (istifadəçi başqa dildə yazıb xahiş etməsə).\n"
+    "Qaydalar:\n"
+    "- Sənin internetə çıxışın yoxdur, real vaxtda axtarış edə bilmirsən. "
+    "Aktual xəbərləri və ya sənin bilmədiyin faktları bilmirsənsə, bunu açıq de, uydurma.\n"
+    "- Bu söhbətdə yalnız son bir neçə mesajı xatırlayırsan. İstifadəçi /reset yazsa, söhbət sıfırlanır.\n"
+    "- Cavabların aydın və qısa olsun, lazım olmayanda uzatma.\n"
+    "- Əmin olmadığın şeyi əmin kimi təqdim etmə."
+)
+
+# Hər söhbət üçün saxlanan maksimum mesaj sayı (10 sual-cavab cütü)
+MAX_HISTORY = 20
+TELEGRAM_LIMIT = 4000  # Telegram mesajı 4096 simvoldan uzun ola bilməz
+
+# Yaddaş RAM-dadır: servis yenidən başlayanda silinir
+chat_histories: dict[int, list[dict]] = {}
+chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    welcome_text = (
-        f"Salam, {user_name}! 👋\n\n"
-        "Mən **StarFish** süni intellekt köməkçisiyəm. "
-        "Mənə istənilən sualı verə bilərsən. Səni dinləyirəm!"
+    name = update.effective_user.first_name
+    await update.message.reply_text(
+        f"Salam, {name}! 👋\n\n"
+        "Mən StarFish süni intellekt köməkçisiyəm. Mənə istənilən sualı verə bilərsən. "
+        "Səni dinləyirəm!"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📌 **Kömək Bölməsi**\n\n"
+    await update.message.reply_text(
+        "📌 Kömək\n\n"
         "- Sadəcə sualını yaz və göndər.\n"
-        "- /start - Botu yenidən başlatmaq üçün\n"
-        "- /help - Bu menyunu görmək üçün"
+        "- Son mesajlarımızı xatırlayıram.\n"
+        "- /reset - söhbəti sıfırla\n"
+        "- /start - salamlaşma\n"
+        "- /help - bu menyu"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
-def ask_gemini(user_message: str):
-    """Modelləri növbə ilə yoxlayır. (cavab, son_xəta) qaytarır."""
-    last_error = None
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_histories.pop(update.effective_chat.id, None)
+    await update.message.reply_text("Söhbət sıfırlandı. Yenidən başlayaq! ✨")
+
+
+def generate_reply(contents: list[dict]) -> str | None:
+    """Modelləri növbə ilə yoxlayır. Bloklayıcıdır, to_thread ilə çağırılır."""
     for model_name in CANDIDATE_MODELS:
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=user_message,
-                config={"system_instruction": SYSTEM_PROMPT},
+                contents=contents,
+                config={"system_instruction": SYSTEM_INSTRUCTION},
             )
             if response.text:
-                return response.text, None
+                return response.text
         except Exception as e:
-            last_error = e
-            logging.warning(f"{model_name} xəta verdi, növbəti model yoxlanılır: {e}")
-    return None, last_error
+            logger.warning("%s xəta verdi, növbəti model yoxlanılır: %s", model_name, e)
+    return None
+
+
+def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    return [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,37 +119,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_message:
         return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    chat_id = update.effective_chat.id
 
-    # Sinxron Gemini çağırışını ayrı thread-də işlədirik ki, bot bloklanmasın
-    bot_reply, last_error = await asyncio.to_thread(ask_gemini, user_message)
+    # Eyni istifadəçinin mesajları sıra ilə işlənsin (yaddaş qarışmasın)
+    async with chat_locks[chat_id]:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    if not bot_reply:
-        logging.error(f"Bütün modellər uğursuz oldu: {last_error}")
-        bot_reply = "Bütün modellər hazırda məşğuldur. Zəhmət olmasa bir azdan yenidən cəhd et."
+        history = chat_histories.get(chat_id, [])
+        contents = history + [{"role": "user", "parts": [{"text": user_message}]}]
 
-    await update.message.reply_text(bot_reply)
+        reply = await asyncio.to_thread(generate_reply, contents)
+
+        if not reply:
+            await update.message.reply_text(
+                "Hazırda cavab verə bilmirəm, modellər məşğuldur. Bir az sonra yenidən yaz."
+            )
+            return
+
+        # Yalnız uğurlu cavabdan sonra yadda saxla
+        contents.append({"role": "model", "parts": [{"text": reply}]})
+        chat_histories[chat_id] = contents[-MAX_HISTORY:]
+
+    for chunk in split_text(reply):
+        await update.message.reply_text(chunk)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Gözlənilməz xəta", exc_info=context.error)
 
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     if RENDER_URL:
-        # Serverdə: webhook rejimi
         print("🤖 StarFish botu webhook rejimində aktivdir...")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=TELEGRAM_TOKEN,
-            webhook_url=f"{RENDER_URL}/{TELEGRAM_TOKEN}",
-            secret_token=WEBHOOK_SECRET,
+            url_path="telegram",
+            webhook_url=f"{RENDER_URL}/telegram",
+            secret_token=WEBHOOK_SECRET or None,
             drop_pending_updates=True,
         )
     else:
-        # Kompüterdə: əvvəlki kimi polling
         print("🤖 StarFish botu polling rejimində aktivdir...")
         app.run_polling()
 
