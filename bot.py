@@ -1,4 +1,6 @@
 import os
+import re
+import html
 import json
 import time
 import asyncio
@@ -8,6 +10,8 @@ from collections import defaultdict
 import tornado.web
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -65,12 +69,14 @@ SYSTEM_INSTRUCTION = (
     "Aktual xəbərləri və ya sənin bilmədiyin faktları bilmirsənsə, bunu açıq de, uydurma.\n"
     "- Bu söhbətdə yalnız son bir neçə mesajı xatırlayırsan. İstifadəçi /reset yazsa, söhbət sıfırlanır.\n"
     "- Cavabların aydın və qısa olsun, lazım olmayanda uzatma.\n"
+    "- Formatlaşdırma: yalnız **qalın**, `kod`, ``` kod blokları və '-' ilə siyahı istifadə et. "
+    "Cədvəl və mürəkkəb Markdown istifadə etmə.\n"
     "- Əmin olmadığın şeyi əmin kimi təqdim etmə."
 )
 
 # Hər söhbət üçün saxlanan maksimum mesaj sayı (10 sual-cavab cütü)
 MAX_HISTORY = 20
-TELEGRAM_LIMIT = 4000  # Telegram mesajı 4096 simvoldan uzun ola bilməz
+TELEGRAM_LIMIT = 3500  # Telegram limiti 4096-dır, HTML teqləri üçün ehtiyat saxlanır
 
 # Yaddaş RAM-dadır: servis yenidən başlayanda silinir
 chat_histories: dict[int, list[dict]] = {}
@@ -127,8 +133,46 @@ def generate_reply(contents: list[dict]) -> str | None:
     return None
 
 
+def _format_inline(text: str) -> str:
+    pieces = re.split(r"(`[^`\n]+`)", text)
+    result = []
+    for piece in pieces:
+        if len(piece) >= 3 and piece.startswith("`") and piece.endswith("`"):
+            result.append(f"<code>{html.escape(piece[1:-1])}</code>")
+            continue
+        t = html.escape(piece, quote=False)
+        t = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", t, flags=re.MULTILINE)
+        t = re.sub(r"^(\s*)[*-]\s+", r"\1• ", t, flags=re.MULTILINE)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.DOTALL)
+        t = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", t)
+        result.append(t)
+    return "".join(result)
+
+
+def md_to_html(text: str) -> str:
+    """Gemini-nin Markdown cavabını Telegram-ın başa düşdüyü HTML-ə çevirir."""
+    parts = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    out = []
+    for part in parts:
+        if len(part) >= 6 and part.startswith("```") and part.endswith("```"):
+            inner = re.sub(r"^[A-Za-z0-9_+-]*\n", "", part[3:-3], count=1)
+            out.append(f"<pre>{html.escape(inner.strip(chr(10)), quote=False)}</pre>")
+        else:
+            out.append(_format_inline(part))
+    return "".join(out)
+
+
 def split_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
+
+
+async def send_formatted(message, text: str):
+    """HTML formatla göndərir, Telegram qəbul etməsə düz mətnlə göndərir."""
+    for chunk in split_text(text):
+        try:
+            await message.reply_text(md_to_html(chunk), parse_mode=ParseMode.HTML)
+        except BadRequest:
+            await message.reply_text(chunk)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,8 +201,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         contents.append({"role": "model", "parts": [{"text": reply}]})
         chat_histories[chat_id] = contents[-MAX_HISTORY:]
 
-    for chunk in split_text(reply):
-        await update.message.reply_text(chunk)
+    await send_formatted(update.message, reply)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
